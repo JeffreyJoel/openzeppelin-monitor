@@ -3,7 +3,6 @@
 //! Provides functionality to send formatted messages to email addresses
 //! via SMTP, supporting message templates with variable substitution.
 
-use async_trait::async_trait;
 use backon::{BackoffBuilder, ExponentialBuilder, Retryable};
 use email_address::EmailAddress;
 use lettre::{
@@ -19,7 +18,7 @@ use std::{collections::HashMap, error::Error as StdError, sync::Arc};
 
 use crate::{
 	models::TriggerTypeConfig,
-	services::notification::{NotificationError, Notifier},
+	services::notification::{template_formatter, NotificationError},
 	utils::{JitterSetting, RetryConfig},
 };
 
@@ -87,111 +86,7 @@ where
 			retry_policy,
 		}
 	}
-}
 
-impl EmailNotifier<AsyncSmtpTransport<Tokio1Executor>> {
-	/// Creates a new email notifier instance
-	///
-	/// # Arguments
-	/// * `smtp_client` - SMTP client
-	/// * `email_content` - Email content configuration
-	///
-	/// # Returns
-	/// * `Result<Self, NotificationError>` - Email notifier instance or error
-	pub fn new(
-		smtp_client: Arc<AsyncSmtpTransport<Tokio1Executor>>,
-		email_content: EmailContent,
-		retry_policy: RetryConfig,
-	) -> Result<Self, NotificationError> {
-		Ok(Self {
-			subject: email_content.subject,
-			body_template: email_content.body_template,
-			sender: email_content.sender,
-			recipients: email_content.recipients,
-			client: smtp_client,
-			retry_policy,
-		})
-	}
-
-	/// Returns the body template of the email.
-	pub fn body_template(&self) -> &str {
-		&self.body_template
-	}
-
-	/// Formats a message by substituting variables in the template and converts it to HTML
-	/// Method is static because property-based tests do not have tokio runtime available,
-	/// which is required for AsyncSmtpTransport
-	///
-	/// # Arguments
-	/// * `variables` - Map of variable names to values
-	///
-	/// # Returns
-	/// * `String` - Formatted message with variables replaced and converted to HTML
-	pub fn format_message(body_template: &str, variables: &HashMap<String, String>) -> String {
-		let formatted_message = variables
-			.iter()
-			.fold(body_template.to_string(), |message, (key, value)| {
-				message.replace(&format!("${{{}}}", key), value)
-			});
-
-		Self::markdown_to_html(&formatted_message)
-	}
-
-	/// Convert a Markdown string into HTML
-	pub fn markdown_to_html(md: &str) -> String {
-		// enable all the extensions you like; or just Parser::new(md) for pure CommonMark
-		let opts = Options::all();
-		let parser = Parser::new_ext(md, opts);
-
-		let mut html_out = String::new();
-		html::push_html(&mut html_out, parser);
-		html_out
-	}
-
-	/// Creates an email notifier from a trigger configuration
-	///
-	/// # Arguments
-	/// * `config` - Trigger configuration containing email parameters
-	///
-	/// # Returns
-	/// * `Result<Self, NotificationError>` - Notifier instance if config is email type
-	pub fn from_config(
-		config: &TriggerTypeConfig,
-		smtp_client: Arc<AsyncSmtpTransport<Tokio1Executor>>,
-	) -> Result<Self, NotificationError> {
-		if let TriggerTypeConfig::Email {
-			message,
-			sender,
-			recipients,
-			retry_policy,
-			..
-		} = config
-		{
-			let email_content = EmailContent {
-				subject: message.title.clone(),
-				body_template: message.body.clone(),
-				sender: sender.clone(),
-				recipients: recipients.clone(),
-			};
-
-			Self::new(smtp_client, email_content, retry_policy.clone())
-		} else {
-			Err(NotificationError::config_error(
-				format!("Invalid email configuration: {:?}", config),
-				None,
-				None,
-			))
-		}
-	}
-}
-
-#[async_trait]
-impl<T> Notifier for EmailNotifier<T>
-where
-	T: AsyncTransport + Clone + Send + Sync + 'static,
-	T::Ok: Send + Sync,
-	T::Error: StdError + Send + Sync + 'static,
-{
 	/// Sends a formatted message to email
 	///
 	/// # Arguments
@@ -199,7 +94,7 @@ where
 	///
 	/// # Returns
 	/// * `Result<(), NotificationError>` - Success or error
-	async fn notify(&self, message: &str) -> Result<(), NotificationError> {
+	pub async fn notify(&self, message: &str) -> Result<(), NotificationError> {
 		let recipients_str = self
 			.recipients
 			.iter()
@@ -284,6 +179,97 @@ where
 			)
 			.when(should_retry)
 			.await
+	}
+}
+
+impl EmailNotifier<AsyncSmtpTransport<Tokio1Executor>> {
+	/// Creates a new email notifier instance
+	///
+	/// # Arguments
+	/// * `smtp_client` - SMTP client
+	/// * `email_content` - Email content configuration
+	///
+	/// # Returns
+	/// * `Result<Self, NotificationError>` - Email notifier instance or error
+	pub fn new(
+		smtp_client: Arc<AsyncSmtpTransport<Tokio1Executor>>,
+		email_content: EmailContent,
+		retry_policy: RetryConfig,
+	) -> Result<Self, NotificationError> {
+		Ok(Self {
+			subject: email_content.subject,
+			body_template: email_content.body_template,
+			sender: email_content.sender,
+			recipients: email_content.recipients,
+			client: smtp_client,
+			retry_policy,
+		})
+	}
+
+	/// Returns the body template of the email.
+	pub fn body_template(&self) -> &str {
+		&self.body_template
+	}
+
+	/// Formats a message by substituting variables in the template and converts it to HTML
+	/// Method is static because property-based tests do not have tokio runtime available,
+	/// which is required for AsyncSmtpTransport
+	///
+	/// # Arguments
+	/// * `variables` - Map of variable names to values
+	///
+	/// # Returns
+	/// * `String` - Formatted message with variables replaced and converted to HTML
+	pub fn format_message(body_template: &str, variables: &HashMap<String, String>) -> String {
+		let formatted_message = template_formatter::format_template(body_template, variables);
+		Self::markdown_to_html(&formatted_message)
+	}
+
+	/// Convert a Markdown string into HTML
+	pub fn markdown_to_html(md: &str) -> String {
+		// enable all the extensions you like; or just Parser::new(md) for pure CommonMark
+		let opts = Options::all();
+		let parser = Parser::new_ext(md, opts);
+
+		let mut html_out = String::new();
+		html::push_html(&mut html_out, parser);
+		html_out
+	}
+
+	/// Creates an email notifier from a trigger configuration
+	///
+	/// # Arguments
+	/// * `config` - Trigger configuration containing email parameters
+	///
+	/// # Returns
+	/// * `Result<Self, NotificationError>` - Notifier instance if config is email type
+	pub fn from_config(
+		config: &TriggerTypeConfig,
+		smtp_client: Arc<AsyncSmtpTransport<Tokio1Executor>>,
+	) -> Result<Self, NotificationError> {
+		if let TriggerTypeConfig::Email {
+			message,
+			sender,
+			recipients,
+			retry_policy,
+			..
+		} = config
+		{
+			let email_content = EmailContent {
+				subject: message.title.clone(),
+				body_template: message.body.clone(),
+				sender: sender.clone(),
+				recipients: recipients.clone(),
+			};
+
+			Self::new(smtp_client, email_content, retry_policy.clone())
+		} else {
+			Err(NotificationError::config_error(
+				format!("Invalid email configuration: {:?}", config),
+				None,
+				None,
+			))
+		}
 	}
 }
 
